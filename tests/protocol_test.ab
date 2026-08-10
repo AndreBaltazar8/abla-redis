@@ -1,7 +1,8 @@
 import "../src/redis.ab"
 
 fun main: int {
-    val stream = RedisStream(TcpConnection(-1),
+    var connection = TcpConnection(-1)
+    val stream = RedisStream(move(connection),
         "+OK\r\n\$5\r\nhello\r\n:-7\r\n*-1\r\n*2\r\n\$3\r\none\r\n:2\r\n")
     val simple = stream.next(1)
     val bulk = stream.next(1)

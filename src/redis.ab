@@ -238,13 +238,15 @@ fun redisEncodeCommand(arguments: array<string>): string {
     output
 }
 
-fun redisClient(config: RedisConfig): RedisClient = RedisClient(
-    config, RedisStream(TcpConnection(-1), ""), false
-)
+fun redisClient(config: RedisConfig): RedisClient {
+    var connection = TcpConnection(-1)
+    RedisClient(config, RedisStream(move(connection), ""), false)
+}
 
 fun RedisClient.disconnect(): void {
     if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
-    this.stream = RedisStream(TcpConnection(-1), "")
+    var connection = TcpConnection(-1)
+    this.stream = RedisStream(move(connection), "")
     this.ready = false
     return
 }
@@ -264,13 +266,13 @@ fun RedisClient.send(arguments: array<string>): RedisValue {
 fun RedisClient.connect(): RedisValue {
     if (this.ready) return redisValue("simple", "OK")
     val address = redisResolveIpv4(this.config.host)
-    val connection = tcpConnectIpv4(
+    var connection = tcpConnectIpv4(
         address, this.config.port, this.config.connectTimeoutMilliseconds
     )
     if (connection.descriptor < 0) {
         return redisFailure("Could not connect to Redis")
     }
-    this.stream = RedisStream(connection, "")
+    this.stream = RedisStream(move(connection), "")
     var result = redisValue("simple", "OK")
     if (this.config.password != "") {
         if (this.config.username == "") {
