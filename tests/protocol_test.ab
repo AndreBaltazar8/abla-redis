@@ -1,0 +1,20 @@
+import "../src/redis.ab"
+
+fun main: int {
+    val stream = RedisStream(TcpConnection(-1),
+        "+OK\r\n\$5\r\nhello\r\n:-7\r\n*-1\r\n*2\r\n\$3\r\none\r\n:2\r\n")
+    val simple = stream.next(1)
+    val bulk = stream.next(1)
+    val integer = stream.next(1)
+    val nullArray = stream.next(1)
+    val array = stream.next(1)
+    if (!simple.succeeded() || simple.text != "OK") 1
+    else if (bulk.kind != "bulk" || bulk.text != "hello") 2
+    else if (integer.kind != "integer" || integer.integer != -7) 3
+    else if (!nullArray.isNull()) 4
+    else if (array.kind != "array" || array.items.size != 2) 5
+    else if (array.items[0].text != "one" || array.items[1].integer != 2) 6
+    else if (redisEncodeCommand(["SET", "key", "value"]) !=
+        "*3\r\n\$3\r\nSET\r\n\$3\r\nkey\r\n\$5\r\nvalue\r\n") 7
+    else 0
+}

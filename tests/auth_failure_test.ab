@@ -1,0 +1,8 @@
+import "../src/redis.ab"
+
+fun main: int {
+    val client = redisClient(redisConfigFromEnvironment())
+    val result = client.ping()
+    client.close()
+    if (!result.succeeded() && result.error != "") 0 else 1
+}

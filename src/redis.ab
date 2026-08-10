@@ -1,0 +1,321 @@
+// RESP2/RESP3 Redis client for Abla Linux services.
+
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+class RedisConfig(
+    val host: string,
+    val port: int = 6379,
+    val username: string = "",
+    val password: string = "",
+    val database: int = 0,
+    val connectTimeoutMilliseconds: int = 3000,
+    val readTimeoutMilliseconds: int = 5000
+)
+
+class RedisValue(
+    val kind: string,
+    val text: string,
+    val integer: int,
+    val items: array<RedisValue>,
+    val error: string
+) {
+    fun succeeded(): bool = this.error == "" && this.kind != "error"
+    fun isNull(): bool = this.kind == "null"
+    fun asString(): string = this.text
+    fun asInt(fallback: int = 0): int =
+        if (this.kind == "integer") this.integer
+        else redisParseInt(this.text, fallback)
+}
+
+class RedisLine(val text: string, val valid: bool)
+
+class RedisStream(val connection: TcpConnection, var buffered: string)
+
+class RedisClient(
+    val config: RedisConfig,
+    var stream: RedisStream,
+    var ready: bool
+)
+
+fun redisValue(
+    kind: string,
+    text: string = "",
+    integer: int = 0,
+    items: array<RedisValue> = [],
+    error: string = ""
+): RedisValue = RedisValue(kind, text, integer, items, error)
+
+fun redisFailure(message: string): RedisValue =
+    redisValue("transport", "", 0, [], message)
+
+fun redisParseInt(value: string, fallback: int = 0): int {
+    var parsed = 0
+    var sign = 1
+    var index = 0
+    var valid = value.size > 0
+    if (valid && value[0] == 45) {
+        sign = -1
+        index = 1
+        if (index == value.size) valid = false
+    }
+    while (valid && index < value.size) {
+        val digit = value[index] - 48
+        if (digit < 0 || digit > 9) valid = false
+        else parsed = parsed * 10 + digit
+        index = index + 1
+    }
+    if (valid) parsed * sign else fallback
+}
+
+fun redisEnvironment(name: string, fallback: string): string {
+    val configured = linuxEnvironment(name)
+    if (configured.found && configured.value != "") configured.value else fallback
+}
+
+fun redisPasswordFromEnvironment(): string {
+    val direct = linuxEnvironment("REDIS_PASSWORD")
+    var result = ""
+    if (direct.found) result = direct.value
+    else {
+        val configuredFile = linuxEnvironment("REDIS_PASSWORD_FILE")
+        if (configuredFile.found && configuredFile.value != "") {
+            val contents = linuxReadFile(configuredFile.value, 65536)
+            var end = contents.size
+            while (end > 0 && (contents[end - 1] == 10 ||
+                contents[end - 1] == 13)) end = end - 1
+            if (end > 0) result = contents.slice(0, end)
+        }
+    }
+    result
+}
+
+fun redisConfigFromEnvironment(): RedisConfig = RedisConfig(
+    redisEnvironment("REDIS_HOST", "127.0.0.1"),
+    redisParseInt(redisEnvironment("REDIS_PORT", "6379"), 6379),
+    redisEnvironment("REDIS_USERNAME", ""),
+    redisPasswordFromEnvironment(),
+    redisParseInt(redisEnvironment("REDIS_DATABASE", "0"), 0),
+    redisParseInt(redisEnvironment("REDIS_CONNECT_TIMEOUT_MS", "3000"), 3000),
+    redisParseInt(redisEnvironment("REDIS_READ_TIMEOUT_MS", "5000"), 5000)
+)
+
+fun redisResolveIpv4(host: string): string {
+    val parsed = linuxIpv4Octets(host)
+    var result = host
+    if (parsed.size != 4) {
+        val command = linuxCommand("getent")
+        command.argument("ahostsv4")
+        command.argument(host)
+        val lookup = command.capture()
+        result = ""
+        if (lookup.status == 0) {
+            var end = 0
+            while (end < lookup.output.size && lookup.output[end] != 32 &&
+                lookup.output[end] != 9 && lookup.output[end] != 10) {
+                end = end + 1
+            }
+            if (end > 0) result = lookup.output.slice(0, end)
+        }
+    }
+    result
+}
+
+fun RedisStream.ensure(count: int, timeoutMilliseconds: int): bool {
+    var attempts = 0
+    while (this.buffered.size < count && attempts < 20) {
+        val slice = if (timeoutMilliseconds < 250) timeoutMilliseconds else 250
+        val chunk = this.connection.readWithTimeout(1048576, slice)
+        if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
+        attempts = attempts + 1
+    }
+    this.buffered.size >= count
+}
+
+fun RedisStream.line(timeoutMilliseconds: int): RedisLine {
+    var end = -1
+    var attempts = 0
+    while (end < 0 && attempts < 20) {
+        var index = 0
+        while (end < 0 && index + 1 < this.buffered.size) {
+            if (this.buffered[index] == 13 &&
+                this.buffered[index + 1] == 10) end = index
+            index = index + 1
+        }
+        if (end < 0) {
+            val slice = if (timeoutMilliseconds < 250)
+                timeoutMilliseconds else 250
+            val chunk = this.connection.readWithTimeout(1048576, slice)
+            if (chunk.size > 0) this.buffered = "${this.buffered}$chunk"
+            attempts = attempts + 1
+        }
+    }
+    var result = RedisLine("", false)
+    if (end >= 0) {
+        result = RedisLine(this.buffered.slice(0, end), true)
+        this.buffered = this.buffered.slice(end + 2, this.buffered.size)
+    }
+    result
+}
+
+fun RedisStream.next(timeoutMilliseconds: int): RedisValue {
+    if (!this.ensure(1, timeoutMilliseconds)) {
+        return redisFailure("Timed out while reading Redis response")
+    }
+    val marker = this.buffered[0]
+    this.buffered = this.buffered.slice(1, this.buffered.size)
+    if (marker == 43 || marker == 45 || marker == 58 || marker == 44 ||
+        marker == 35 || marker == 95) {
+        val line = this.line(timeoutMilliseconds)
+        if (!line.valid) return redisFailure("Redis response line is incomplete")
+        if (marker == 43) return redisValue("simple", line.text)
+        if (marker == 45) return redisValue(
+            "error", line.text, 0, [], line.text
+        )
+        if (marker == 58) return redisValue(
+            "integer", line.text, redisParseInt(line.text)
+        )
+        if (marker == 44) return redisValue("double", line.text)
+        if (marker == 35) return redisValue(
+            "boolean", line.text, if (line.text == "t") 1 else 0
+        )
+        return redisValue("null")
+    }
+    if (marker == 36 || marker == 33 || marker == 61) {
+        val line = this.line(timeoutMilliseconds)
+        if (!line.valid) return redisFailure("Redis bulk length is incomplete")
+        val count = redisParseInt(line.text, -2)
+        if (count == -1) return redisValue("null")
+        if (count < 0 || count > 16777216) {
+            return redisFailure("Redis bulk length is invalid")
+        }
+        if (!this.ensure(count + 2, timeoutMilliseconds) ||
+            this.buffered[count] != 13 || this.buffered[count + 1] != 10) {
+            return redisFailure("Redis bulk payload is incomplete")
+        }
+        val value = this.buffered.slice(0, count)
+        this.buffered = this.buffered.slice(count + 2, this.buffered.size)
+        if (marker == 33) return redisValue("error", value, 0, [], value)
+        if (marker == 61) return redisValue("verbatim", value)
+        return redisValue("bulk", value)
+    }
+    if (marker == 42 || marker == 37 || marker == 126 || marker == 62) {
+        val line = this.line(timeoutMilliseconds)
+        if (!line.valid) return redisFailure("Redis collection length is incomplete")
+        var count = redisParseInt(line.text, -2)
+        if (count == -1) return redisValue("null")
+        if (count < 0 || count > 1048576) {
+            return redisFailure("Redis collection length is invalid")
+        }
+        if (marker == 37) count = count * 2
+        val items: array<RedisValue> = []
+        var index = 0
+        var error = ""
+        while (error == "" && index < count) {
+            val item = this.next(timeoutMilliseconds)
+            if (item.kind == "transport") error = item.error
+            else items.append(item)
+            index = index + 1
+        }
+        if (error != "") return redisFailure(error)
+        var kind = "array"
+        if (marker == 37) kind = "map"
+        if (marker == 126) kind = "set"
+        if (marker == 62) kind = "push"
+        return redisValue(kind, "", 0, items)
+    }
+    redisFailure("Redis response has an unsupported type marker")
+}
+
+fun redisEncodeCommand(arguments: array<string>): string {
+    var output = "*${arguments.size}\r\n"
+    var index = 0
+    while (index < arguments.size) {
+        val argument = arguments[index]
+        output = "$output\$${argument.size}\r\n$argument\r\n"
+        index = index + 1
+    }
+    output
+}
+
+fun redisClient(config: RedisConfig): RedisClient = RedisClient(
+    config, RedisStream(TcpConnection(-1), ""), false
+)
+
+fun RedisClient.disconnect(): void {
+    if (this.stream.connection.descriptor >= 0) this.stream.connection.close()
+    this.stream = RedisStream(TcpConnection(-1), "")
+    this.ready = false
+    return
+}
+
+fun RedisClient.send(arguments: array<string>): RedisValue {
+    val payload = redisEncodeCommand(arguments)
+    if (this.stream.connection.write(payload) != payload.size) {
+        this.disconnect()
+        redisFailure("Could not write Redis command")
+    } else {
+        val result = this.stream.next(this.config.readTimeoutMilliseconds)
+        if (result.kind == "transport") this.disconnect()
+        result
+    }
+}
+
+fun RedisClient.connect(): RedisValue {
+    if (this.ready) return redisValue("simple", "OK")
+    val address = redisResolveIpv4(this.config.host)
+    val connection = tcpConnectIpv4(
+        address, this.config.port, this.config.connectTimeoutMilliseconds
+    )
+    if (connection.descriptor < 0) {
+        return redisFailure("Could not connect to Redis")
+    }
+    this.stream = RedisStream(connection, "")
+    var result = redisValue("simple", "OK")
+    if (this.config.password != "") {
+        if (this.config.username == "") {
+            result = this.send(["AUTH", this.config.password])
+        } else result = this.send([
+            "AUTH", this.config.username, this.config.password
+        ])
+    }
+    if (result.succeeded() && this.config.database != 0) {
+        result = this.send(["SELECT", "${this.config.database}"])
+    }
+    this.ready = result.succeeded()
+    if (!this.ready) this.disconnect()
+    result
+}
+
+fun RedisClient.command(arguments: array<string>): RedisValue {
+    var result = this.connect()
+    if (result.succeeded()) result = this.send(arguments)
+    result
+}
+
+fun RedisClient.get(key: string): RedisValue = this.command(["GET", key])
+
+fun RedisClient.set(key: string, value: string): RedisValue =
+    this.command(["SET", key, value])
+
+fun RedisClient.delete(key: string): RedisValue = this.command(["DEL", key])
+
+fun RedisClient.increment(key: string): RedisValue =
+    this.command(["INCR", key])
+
+fun RedisClient.expire(key: string, seconds: int): RedisValue =
+    this.command(["EXPIRE", key, "$seconds"])
+
+fun RedisClient.ping(): RedisValue = this.command(["PING"])
+
+fun RedisClient.close(): void = this.disconnect()
+
+fun redisCommand(
+    config: RedisConfig,
+    arguments: array<string>
+): RedisValue {
+    val client = redisClient(config)
+    val result = client.command(arguments)
+    client.close()
+    result
+}

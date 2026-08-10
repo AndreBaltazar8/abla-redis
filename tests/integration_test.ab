@@ -1,0 +1,25 @@
+import "../src/redis.ab"
+
+fun main: int {
+    val client = redisClient(redisConfigFromEnvironment())
+    val ping = client.ping()
+    val written = client.set("abla:test:text", "hello from Abla")
+    val found = client.get("abla:test:text")
+    val first = client.increment("abla:test:counter")
+    val second = client.increment("abla:test:counter")
+    val expiry = client.expire("abla:test:text", 60)
+    val removed = client.delete("abla:test:text")
+    val missing = client.get("abla:test:text")
+    val expectedError = client.command(["ABLA_UNKNOWN_COMMAND"])
+    val afterError = client.ping()
+    client.close()
+    if (!ping.succeeded() || ping.text != "PONG") 10
+    else if (!written.succeeded() || written.text != "OK") 20
+    else if (!found.succeeded() || found.text != "hello from Abla") 30
+    else if (first.integer != 1 || second.integer != 2) 40
+    else if (expiry.integer != 1 || removed.integer != 1) 50
+    else if (!missing.isNull()) 60
+    else if (expectedError.kind != "error" || expectedError.error == "") 70
+    else if (!afterError.succeeded() || afterError.text != "PONG") 80
+    else 0
+}
