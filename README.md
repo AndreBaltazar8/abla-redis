@@ -16,7 +16,8 @@ C wrapper, or sidecar.
 - Docker/Icy service-name resolution;
 - environment and secret-file configuration; and
 - a nonblocking client for event loops (`src/async.ab`): pipelined commands
-  answered in order, verified TLS, AUTH/SELECT on connect, reconnects, and
+  answered in order, hostnames resolved without blocking (`abla/dns/async`),
+  verified TLS, AUTH/SELECT on connect, reconnects, and
   timeouts for unanswered or never-sent commands.
 
 ## Import
@@ -88,7 +89,8 @@ localhost port publishing is required between the services.
 `redis:7-alpine` container and verifies authentication, reads, writes, counters,
 expiry, null replies, and recovery after a server error; for the async client
 it also covers pipelining, MULTI/EXEC, a wrong password, a mid-run restart,
-and a TLS server with a throwaway CA (and a wrong CA refused).
+a TLS server with a throwaway CA (and a wrong CA refused), and a lookup
+against a nameserver that never answers leaving `step(0)` nonblocking.
 
 ## Scope
 

@@ -13,6 +13,7 @@
 
 import "abla/text"
 import "abla/dns"
+import "abla/dns/async"
 import "abla/http/async"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
@@ -31,7 +32,9 @@ class RedisAsyncOptions(
     val reconnectWaitMilliseconds: int = 1000,
     // a command unanswered this long fails the connection; one still waiting
     // for a connection this long fails on its own
-    val replyTimeoutMilliseconds: int = 10000
+    val replyTimeoutMilliseconds: int = 10000,
+    // the DNS server for the host; empty reads /etc/resolv.conf
+    val dnsNameserver: string = ""
 )
 
 class RedisAsyncReply(val id: int, val value: RedisValue)
@@ -45,11 +48,16 @@ val redisAsyncIdle = 0
 val redisAsyncConnecting = 1
 val redisAsyncHandshaking = 2
 val redisAsyncOpen = 3
+// waiting on the resolver for the host's address
+val redisAsyncResolving = 4
 
 resource class RedisAsyncClient(
     val options: RedisAsyncOptions,
     val poller: SocketPoller,
     val reader: HttpAsyncRead,
+    val resolver: DnsAsyncResolver,
+    // the resolver query for the host (0 when none)
+    var resolveId: int,
     var state: int,
     var descriptor: int,
     var sslContext: int,
@@ -84,6 +92,7 @@ resource class RedisAsyncClient(
             SSL_CTX_free(nativePointerFromAddress(this.sslContext))
             this.sslContext = 0
         }
+        this.resolver.close()
         this.poller.close()
         return
     }
@@ -91,7 +100,8 @@ resource class RedisAsyncClient(
 
 fun redisAsyncClient(options: RedisAsyncOptions = RedisAsyncOptions()): RedisAsyncClient =
     RedisAsyncClient(
-        options, socketPoller(), HttpAsyncRead("", 0), redisAsyncIdle, -1, 0, 0,
+        options, socketPoller(), HttpAsyncRead("", 0),
+        dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = options.connectTimeoutMilliseconds, nameserver = options.dnsNameserver)), 0, redisAsyncIdle, -1, 0, 0,
         "", 0, "", [], [], [], [], [], [], [], 1, 0, 0
     )
 
@@ -108,14 +118,6 @@ fun redisAsyncOptionsFromEnvironment(): RedisAsyncOptions {
 
 fun redisAsyncNow(): int = linuxMonotonicMilliseconds()
 
-fun redisAsyncResolve(host: string, timeoutMilliseconds: int): string {
-    val numeric = httpAsyncNumericIpv4(host)
-    if (numeric != "") return numeric
-    val resolved = dnsResolveType(host, 1, timeoutMilliseconds, "")
-    var address = ""
-    if (resolved.addresses.size > 0) address = resolved.addresses[0].address
-    address
-}
 
 // One whole RESP value at `offset`, or incomplete (complete false, value a
 // transport failure when the bytes can never parse).
@@ -181,6 +183,10 @@ fun RedisAsyncClient.interest(write: bool): void {
 // Drops the connection: in-flight commands fail, queued ones wait for the next.
 fun RedisAsyncClient.fail(detail: string): void {
     val wasOpen = this.state == redisAsyncOpen
+    if (this.resolveId != 0) {
+        this.resolver.cancel(this.resolveId)
+        this.resolveId = 0
+    }
     if (this.session != 0) {
         httpAsyncTlsFree(this.session)
         this.session = 0
@@ -204,11 +210,38 @@ fun RedisAsyncClient.fail(detail: string): void {
 
 fun RedisAsyncClient.startConnect(): void {
     this.event("connecting", "${this.options.host}:${this.options.port}")
-    val address = redisAsyncResolve(this.options.host, this.options.connectTimeoutMilliseconds)
-    if (address == "") {
-        this.fail("could not resolve ${this.options.host}")
+    val numeric = httpAsyncNumericIpv4(this.options.host)
+    if (numeric != "") {
+        this.connectTo(numeric)
         return
     }
+    // the resolver answers in step(); a literal address finishes at once
+    this.resolveId = this.resolver.start(this.options.host, 1)
+    this.state = redisAsyncResolving
+    this.resolved()
+    return
+}
+
+// the host's address once the resolver has it
+fun RedisAsyncClient.resolved(): void {
+    if (this.resolveId == 0 || !this.resolver.done(this.resolveId)) return
+    val result = this.resolver.take(this.resolveId)
+    this.resolveId = 0
+    var address = ""
+    var error = "no address"
+    if (result != null) {
+        if (result.resolution.addresses.size > 0) address = result.resolution.addresses[0].address
+        if (result.error != "") error = result.error
+    }
+    if (address == "") {
+        this.fail("could not resolve ${this.options.host}: " + error)
+        return
+    }
+    this.connectTo(address)
+    return
+}
+
+fun RedisAsyncClient.connectTo(address: string): void {
     val descriptor = httpAsyncConnect(address, this.options.port)
     if (descriptor < 0) {
         this.fail("connect failed (errno ${-descriptor})")
@@ -434,6 +467,13 @@ fun RedisAsyncClient.timers(now: int): void {
 // Progresses the connection for up to `timeoutMilliseconds` (0 never blocks).
 fun RedisAsyncClient.step(timeoutMilliseconds: int = 0): int {
     this.timers(redisAsyncNow())
+    if (this.state == redisAsyncResolving) {
+        // no socket yet: wait on the resolver instead
+        this.resolver.step(if (timeoutMilliseconds < 0) 0 else timeoutMilliseconds)
+        this.resolved()
+        this.timers(redisAsyncNow())
+        return 0
+    }
     var timeout = timeoutMilliseconds
     if (timeout < 0 || this.descriptor < 0) timeout = 0
     val records = this.poller.waitCompact(64, timeout)

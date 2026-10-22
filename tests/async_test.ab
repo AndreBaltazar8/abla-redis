@@ -1,8 +1,10 @@
 // redisAsyncClient against a real server (tools/test-async.sh): pipelined
 // commands answered in order, null and error replies, MULTI/EXEC, a wrong
-// password failing its commands, a restart mid-run, and TLS.
+// password failing its commands, a restart mid-run, TLS, and a host whose
+// lookup never answers resolving without blocking the loop.
 
 import "abla/io"
+import "abla/text"
 import "abla/sys/linux/process"
 import "../src/async.ab"
 
@@ -94,5 +96,28 @@ fun main: int {
     val refused = run(untrusted, 1, 10)
     untrusted.close()
     if (refused.size != 1 || refused[0].value.succeeded()) return 41
+    // a nameserver that never answers: step(0) stays nonblocking, then the
+    // lookup times out and fails the command
+    var lost = redisAsyncClient(RedisAsyncOptions("redis.example.invalid", 6379, connectTimeoutMilliseconds = 1500,
+        replyTimeoutMilliseconds = 20000, dnsNameserver = "10.255.255.1"))
+    lost.get("k")
+    val before = linuxMonotonicMilliseconds()
+    var spins = 0
+    while (spins < 100) {
+        lost.step(0)
+        spins += 1
+    }
+    if (linuxMonotonicMilliseconds() - before > 200) return 50
+    var resolveError = ""
+    val lostDeadline = linuxMonotonicMilliseconds() + 5000
+    while (resolveError == "" && linuxMonotonicMilliseconds() < lostDeadline) {
+        lost.step(50)
+        for (event in lost.takeEvents()) if (event.kind == "error" && event.detail.contains("could not resolve")) resolveError = event.detail
+    }
+    lost.close()
+    if (!resolveError.contains("dns timeout")) {
+        println("resolve: " + resolveError)
+        return 51
+    }
     0
 }

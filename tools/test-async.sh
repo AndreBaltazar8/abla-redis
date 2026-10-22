@@ -60,4 +60,4 @@ if [[ $status -ne 0 ]]; then
     printf 'async test failed with %s\n' "$status" >&2
     exit "$status"
 fi
-printf '%s\n' 'Redis async pipelining, errors, MULTI/EXEC, auth failure, restart, and TLS passed'
+printf '%s\n' 'Redis async pipelining, errors, MULTI/EXEC, auth failure, restart, TLS, and nonblocking DNS passed'
