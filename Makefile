@@ -9,4 +9,5 @@ check:
 	build/protocol-test
 
 test: check
-	./tools/test-redis.sh
+	ABLAC=$(COMPILER) ./tools/test-redis.sh
+	ABLAC=$(COMPILER) ./tools/test-async.sh

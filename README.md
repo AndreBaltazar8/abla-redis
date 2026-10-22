@@ -13,8 +13,11 @@ C wrapper, or sidecar.
 - bounded connection and read timeouts;
 - typed simple, bulk, integer, array, map, set, push, null, and error values;
 - convenience operations for `GET`, `SET`, `DEL`, `INCR`, `EXPIRE`, and `PING`;
-- Docker/Icy service-name resolution; and
-- environment and secret-file configuration.
+- Docker/Icy service-name resolution;
+- environment and secret-file configuration; and
+- a nonblocking client for event loops (`src/async.ab`): pipelined commands
+  answered in order, verified TLS, AUTH/SELECT on connect, reconnects, and
+  timeouts for unanswered or never-sent commands.
 
 ## Import
 
@@ -44,6 +47,23 @@ fun main: int {
 }
 ```
 
+For a service loop that must never block, use the async client:
+
+```abla
+import "../../abla-redis/src/async.ab"
+
+fun main: int {
+    var cache = redisAsyncClient(redisAsyncOptionsFromEnvironment())
+    val id = cache.get("greeting")
+    while (cache.pending() > 0) cache.step(50)
+    for (reply in cache.takeReplies()) if (reply.id == id) println(reply.value.text)
+    cache.close()
+    0
+}
+```
+
+`REDIS_TLS=1` and `REDIS_CA_FILE` configure TLS for it.
+
 `command(["HSET", "user:42", "name", "Andre"])` exposes the full Redis
 command surface. Arguments are always encoded as bulk strings, so application
 data never becomes protocol syntax.
@@ -66,13 +86,16 @@ localhost port publishing is required between the services.
 
 `make check` runs protocol fixtures. `make test` additionally starts a temporary
 `redis:7-alpine` container and verifies authentication, reads, writes, counters,
-expiry, null replies, and recovery after a server error.
+expiry, null replies, and recovery after a server error; for the async client
+it also covers pipelining, MULTI/EXEC, a wrong password, a mid-run restart,
+and a TLS server with a throwaway CA (and a wrong CA refused).
 
 ## Scope
 
-This package currently targets the direct Linux TCP backend. TLS, Sentinel,
-Cluster redirections, client-side caching, and asynchronous pub/sub loops are
-future layers; ordinary commands and RESP3 values are already represented
+This package currently targets the direct Linux TCP backend. The blocking
+client is plain TCP; the async client adds TLS and nonblocking pipelining.
+Sentinel, Cluster redirections, client-side caching, and pub/sub are future
+layers; ordinary commands and RESP3 values are already represented
 without constraining those additions.
 
 Licensed under the Mozilla Public License 2.0.

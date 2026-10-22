@@ -1,0 +1,524 @@
+// Nonblocking Redis for event-loop services. Commands are pipelined on one
+// connection and answered in order: command() returns an id, step() drives
+// the connect, optional TLS, AUTH/SELECT, writes and reads over one poller
+// without blocking past its timeout, and takeReplies() hands back
+// (id, RedisValue). A dropped connection answers its in-flight commands with
+// a transport failure and reconnects for the next ones.
+//
+//     var cache = redisAsyncClient(RedisAsyncOptions("cache.internal", 25061, "default", "secret", tls = true))
+//     val id = cache.command(["GET", "k:1"])
+//     ...each loop iteration:
+//     cache.step(0)
+//     for (reply in cache.takeReplies()) if (reply.id == id) use(reply.value)
+
+import "abla/text"
+import "abla/dns"
+import "abla/http/async"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+import "./redis.ab"
+
+class RedisAsyncOptions(
+    val host: string = "127.0.0.1",
+    val port: int = 6379,
+    val username: string = "",
+    val password: string = "",
+    val tls: bool = false,
+    // Empty uses the system trust store.
+    val caPath: string = "",
+    val database: int = 0,
+    val connectTimeoutMilliseconds: int = 3000,
+    val reconnectWaitMilliseconds: int = 1000,
+    // a command unanswered this long fails the connection; one still waiting
+    // for a connection this long fails on its own
+    val replyTimeoutMilliseconds: int = 10000
+)
+
+class RedisAsyncReply(val id: int, val value: RedisValue)
+
+// kind: connecting | connected | disconnected | error
+class RedisAsyncEvent(val kind: string, val detail: string)
+
+class RedisParsed(val value: RedisValue, val next: int, val complete: bool)
+
+val redisAsyncIdle = 0
+val redisAsyncConnecting = 1
+val redisAsyncHandshaking = 2
+val redisAsyncOpen = 3
+
+resource class RedisAsyncClient(
+    val options: RedisAsyncOptions,
+    val poller: SocketPoller,
+    val reader: HttpAsyncRead,
+    var state: int,
+    var descriptor: int,
+    var sslContext: int,
+    var session: int,
+    var output: string,
+    var outputOffset: int,
+    var input: string,
+    // commands written or queued on this connection, in order; id < 0 is a
+    // connection setup command (AUTH / SELECT) whose reply is not handed out
+    var inFlight: array<int>,
+    var inFlightSince: array<int>,
+    // commands waiting for a connection
+    var queued: array<string>,
+    var queuedIds: array<int>,
+    var queuedSince: array<int>,
+    var replies: array<RedisAsyncReply>,
+    var events: array<RedisAsyncEvent>,
+    var nextId: int,
+    var retryAt: int,
+    var deadline: int
+) {
+    trusted fun drop(): void {
+        if (this.session != 0) {
+            httpAsyncTlsFree(this.session)
+            this.session = 0
+        }
+        if (this.descriptor >= 0) {
+            linuxTcpCloseDescriptor(this.descriptor)
+            this.descriptor = -1
+        }
+        if (this.sslContext != 0) {
+            SSL_CTX_free(nativePointerFromAddress(this.sslContext))
+            this.sslContext = 0
+        }
+        this.poller.close()
+        return
+    }
+}
+
+fun redisAsyncClient(options: RedisAsyncOptions = RedisAsyncOptions()): RedisAsyncClient =
+    RedisAsyncClient(
+        options, socketPoller(), HttpAsyncRead("", 0), redisAsyncIdle, -1, 0, 0,
+        "", 0, "", [], [], [], [], [], [], [], 1, 0, 0
+    )
+
+// REDIS_* from the environment (see redisConfigFromEnvironment) plus
+// REDIS_TLS=1 and REDIS_CA_FILE.
+fun redisAsyncOptionsFromEnvironment(): RedisAsyncOptions {
+    val config = redisConfigFromEnvironment()
+    RedisAsyncOptions(
+        config.host, config.port, config.username, config.password,
+        redisEnvironment("REDIS_TLS", "") == "1", redisEnvironment("REDIS_CA_FILE", ""),
+        config.database, config.connectTimeoutMilliseconds
+    )
+}
+
+fun redisAsyncNow(): int = linuxMonotonicMilliseconds()
+
+fun redisAsyncResolve(host: string, timeoutMilliseconds: int): string {
+    val numeric = httpAsyncNumericIpv4(host)
+    if (numeric != "") return numeric
+    val resolved = dnsResolveType(host, 1, timeoutMilliseconds, "")
+    var address = ""
+    if (resolved.addresses.size > 0) address = resolved.addresses[0].address
+    address
+}
+
+// One whole RESP value at `offset`, or incomplete (complete false, value a
+// transport failure when the bytes can never parse).
+fun redisParseAt(buffer: string, offset: int): RedisParsed {
+    if (offset >= buffer.size) return RedisParsed(redisValue("null"), offset, false)
+    val marker = buffer[offset]
+    var end = -1
+    var index = offset + 1
+    while (end < 0 && index + 1 < buffer.size) {
+        if (buffer[index] == 13 && buffer[index + 1] == 10) end = index
+        index = index + 1
+    }
+    if (end < 0) return RedisParsed(redisValue("null"), offset, false)
+    val line = buffer.slice(offset + 1, end)
+    val after = end + 2
+    if (marker == 43) return RedisParsed(redisValue("simple", line), after, true)
+    if (marker == 45) return RedisParsed(redisValue("error", line, 0, [], line), after, true)
+    if (marker == 58) return RedisParsed(redisValue("integer", line, redisParseInt(line)), after, true)
+    if (marker == 44) return RedisParsed(redisValue("double", line), after, true)
+    if (marker == 35) return RedisParsed(redisValue("boolean", line, if (line == "t") 1 else 0), after, true)
+    if (marker == 95) return RedisParsed(redisValue("null"), after, true)
+    if (marker == 36 || marker == 33 || marker == 61) {
+        val count = redisParseInt(line, -2)
+        if (count == -1) return RedisParsed(redisValue("null"), after, true)
+        if (count < 0 || count > 16777216) return RedisParsed(redisFailure("Redis bulk length is invalid"), after, true)
+        if (buffer.size < after + count + 2) return RedisParsed(redisValue("null"), offset, false)
+        val value = buffer.slice(after, after + count)
+        if (marker == 33) return RedisParsed(redisValue("error", value, 0, [], value), after + count + 2, true)
+        return RedisParsed(redisValue(if (marker == 61) "verbatim" else "bulk", value), after + count + 2, true)
+    }
+    if (marker == 42 || marker == 37 || marker == 126 || marker == 62) {
+        var count = redisParseInt(line, -2)
+        if (count == -1) return RedisParsed(redisValue("null"), after, true)
+        if (count < 0 || count > 1048576) return RedisParsed(redisFailure("Redis collection length is invalid"), after, true)
+        if (marker == 37) count = count * 2
+        val items: array<RedisValue> = []
+        var at = after
+        var item = 0
+        while (item < count) {
+            val parsed = redisParseAt(buffer, at)
+            if (!parsed.complete) return RedisParsed(redisValue("null"), offset, false)
+            if (parsed.value.kind == "transport") return RedisParsed(parsed.value, parsed.next, true)
+            items.append(parsed.value)
+            at = parsed.next
+            item = item + 1
+        }
+        val kind = if (marker == 37) "map" else if (marker == 126) "set" else if (marker == 62) "push" else "array"
+        return RedisParsed(redisValue(kind, "", 0, items), at, true)
+    }
+    RedisParsed(redisFailure("Redis response has an unsupported type marker"), after, true)
+}
+
+fun RedisAsyncClient.event(kind: string, detail: string = ""): void {
+    this.events.append(RedisAsyncEvent(kind, detail))
+    return
+}
+
+fun RedisAsyncClient.interest(write: bool): void {
+    if (this.descriptor >= 0) this.poller.modifyDescriptor(this.descriptor, true, write)
+    return
+}
+
+// Drops the connection: in-flight commands fail, queued ones wait for the next.
+fun RedisAsyncClient.fail(detail: string): void {
+    val wasOpen = this.state == redisAsyncOpen
+    if (this.session != 0) {
+        httpAsyncTlsFree(this.session)
+        this.session = 0
+    }
+    if (this.descriptor >= 0) {
+        this.poller.unwatchDescriptor(this.descriptor)
+        linuxTcpCloseDescriptor(this.descriptor)
+        this.descriptor = -1
+    }
+    for (id in this.inFlight) if (id > 0) this.replies.append(RedisAsyncReply(id, redisFailure(detail)))
+    this.inFlight = []
+    this.inFlightSince = []
+    this.output = ""
+    this.outputOffset = 0
+    this.input = ""
+    this.event(if (wasOpen) "disconnected" else "error", detail)
+    this.state = redisAsyncIdle
+    this.retryAt = redisAsyncNow() + (if (wasOpen) 0 else this.options.reconnectWaitMilliseconds)
+    return
+}
+
+fun RedisAsyncClient.startConnect(): void {
+    this.event("connecting", "${this.options.host}:${this.options.port}")
+    val address = redisAsyncResolve(this.options.host, this.options.connectTimeoutMilliseconds)
+    if (address == "") {
+        this.fail("could not resolve ${this.options.host}")
+        return
+    }
+    val descriptor = httpAsyncConnect(address, this.options.port)
+    if (descriptor < 0) {
+        this.fail("connect failed (errno ${-descriptor})")
+        return
+    }
+    this.descriptor = descriptor
+    this.state = redisAsyncConnecting
+    this.deadline = redisAsyncNow() + this.options.connectTimeoutMilliseconds
+    this.poller.watchDescriptor(descriptor, true, true)
+    return
+}
+
+fun RedisAsyncClient.connected(): void {
+    if (this.options.tls) {
+        if (this.sslContext == 0) this.sslContext = httpAsyncTlsContext(this.options.caPath)
+        val session = if (this.sslContext == 0) 0 else httpAsyncTlsSession(this.sslContext, this.options.host, this.descriptor)
+        if (session == 0) {
+            this.fail("tls setup failed")
+            return
+        }
+        this.session = session
+        this.state = redisAsyncHandshaking
+        this.handshake()
+    } else this.opened()
+    return
+}
+
+fun RedisAsyncClient.handshake(): void {
+    val result = httpAsyncTlsHandshake(this.session)
+    if (result == 1) this.opened()
+    else if (result == -2) this.interest(false)
+    else if (result == -3) this.interest(true)
+    else if (result == -100) this.fail("tls certificate verification failed")
+    else this.fail("tls handshake failed")
+    return
+}
+
+// AUTH and SELECT go first; the queued commands follow on the same write.
+fun RedisAsyncClient.opened(): void {
+    this.state = redisAsyncOpen
+    this.event("connected", "${this.options.host}:${this.options.port}")
+    var setup = ""
+    if (this.options.password != "") {
+        setup = if (this.options.username == "") redisEncodeCommand(["AUTH", this.options.password])
+            else redisEncodeCommand(["AUTH", this.options.username, this.options.password])
+        this.inFlight.append(-1)
+        this.inFlightSince.append(redisAsyncNow())
+    }
+    if (this.options.database != 0) {
+        setup = "$setup${redisEncodeCommand(["SELECT", "${this.options.database}"])}"
+        this.inFlight.append(-2)
+        this.inFlightSince.append(redisAsyncNow())
+    }
+    var index = 0
+    while (index < this.queued.size) {
+        setup = "$setup${this.queued[index]}"
+        this.inFlight.append(this.queuedIds[index])
+        this.inFlightSince.append(redisAsyncNow())
+        index = index + 1
+    }
+    this.queued = []
+    this.queuedIds = []
+    this.queuedSince = []
+    if (setup != "") this.queueWrite(setup)
+    else this.interest(false)
+    return
+}
+
+fun RedisAsyncClient.queueWrite(text: string): void {
+    this.output = if (this.output == "") text else "${this.output}$text"
+    this.writeReady()
+    return
+}
+
+fun RedisAsyncClient.writeReady(): void {
+    var writing = this.descriptor >= 0
+    while (writing) {
+        if (this.outputOffset >= this.output.size) {
+            this.output = ""
+            this.outputOffset = 0
+            this.interest(false)
+            writing = false
+        } else if (this.session != 0) {
+            val written = httpAsyncTlsWrite(this.session, this.output, this.outputOffset)
+            if (written > 0) this.outputOffset = this.outputOffset + written
+            else if (written == -3 || written == -2) {
+                this.interest(true)
+                writing = false
+            } else {
+                this.fail("tls write failed")
+                writing = false
+            }
+        } else {
+            var connection = TcpConnection(this.descriptor)
+            val result = connection.writeCompact(this.output, this.outputOffset)
+            connection.descriptor = -1
+            if (result.written > 0) this.outputOffset = this.outputOffset + result.written
+            if (result.status == "error") {
+                if (result.errorCode == 11) this.interest(true)
+                else this.fail("write failed")
+                writing = false
+            }
+        }
+    }
+    return
+}
+
+fun RedisAsyncClient.readReady(): void {
+    var reading = this.descriptor >= 0
+    while (reading) {
+        if (this.session != 0) httpAsyncTlsRead(this.session, this.reader)
+        else httpAsyncPlainRead(this.descriptor, this.reader)
+        val status = this.reader.status
+        val chunk = this.reader.text
+        this.reader.text = ""
+        if (status > 0) {
+            this.input = if (this.input == "") chunk else "${this.input}$chunk"
+            this.parse()
+            reading = this.descriptor >= 0
+        } else {
+            val wouldBlock = if (this.session != 0) status == -2 || status == -3 else status == -11
+            if (wouldBlock) {
+                if (this.session != 0 && status == -3) this.interest(true)
+            } else this.fail("connection closed")
+            reading = false
+        }
+    }
+    return
+}
+
+// Hands out every whole reply, in command order. A failed AUTH / SELECT
+// drops the connection (the commands behind it fail with its error).
+fun RedisAsyncClient.parse(): void {
+    var offset = 0
+    var going = true
+    while (going) {
+        val parsed = redisParseAt(this.input, offset)
+        if (!parsed.complete) going = false
+        else if (parsed.value.kind == "transport") {
+            this.input = ""
+            this.fail(parsed.value.error)
+            return
+        } else if (parsed.value.kind == "push") offset = parsed.next
+        else {
+            offset = parsed.next
+            if (this.inFlight.size == 0) {
+                this.input = ""
+                this.fail("Redis sent a reply nothing asked for")
+                return
+            }
+            val id = this.inFlight[0]
+            var rest: array<int> = []
+            var since: array<int> = []
+            var index = 1
+            while (index < this.inFlight.size) {
+                rest.append(this.inFlight[index])
+                since.append(this.inFlightSince[index])
+                index = index + 1
+            }
+            this.inFlight = rest
+            this.inFlightSince = since
+            if (id > 0) this.replies.append(RedisAsyncReply(id, parsed.value))
+            else if (!parsed.value.succeeded()) {
+                this.input = ""
+                this.fail(parsed.value.error)
+                return
+            }
+        }
+    }
+    this.input = this.input.slice(offset, this.input.size)
+    return
+}
+
+fun RedisAsyncClient.socketReady(readable: bool, writable: bool, failed: bool): void {
+    if (this.state == redisAsyncConnecting) {
+        if (writable || failed) {
+            val error = httpAsyncSocketError(this.descriptor)
+            if (error != 0) this.fail("connect failed (errno $error)")
+            else this.connected()
+        }
+    } else if (this.state == redisAsyncHandshaking) this.handshake()
+    else if (this.state == redisAsyncOpen) {
+        if (writable && this.output != "") this.writeReady()
+        if (this.descriptor >= 0 && (readable || failed || (this.session != 0 && writable))) this.readReady()
+    }
+    return
+}
+
+// Commands that waited too long for a connection fail.
+fun RedisAsyncClient.expireQueued(now: int): void {
+    var keptCommands: array<string> = []
+    var keptIds: array<int> = []
+    var keptSince: array<int> = []
+    var index = 0
+    while (index < this.queued.size) {
+        if (now - this.queuedSince[index] >= this.options.replyTimeoutMilliseconds) {
+            this.replies.append(RedisAsyncReply(this.queuedIds[index], redisFailure("Redis unavailable")))
+        } else {
+            keptCommands.append(this.queued[index])
+            keptIds.append(this.queuedIds[index])
+            keptSince.append(this.queuedSince[index])
+        }
+        index = index + 1
+    }
+    this.queued = keptCommands
+    this.queuedIds = keptIds
+    this.queuedSince = keptSince
+    return
+}
+
+fun RedisAsyncClient.timers(now: int): void {
+    if (this.state != redisAsyncOpen && this.queued.size > 0) this.expireQueued(now)
+    if (this.state == redisAsyncIdle && this.queued.size > 0 && now >= this.retryAt) this.startConnect()
+    else if ((this.state == redisAsyncConnecting || this.state == redisAsyncHandshaking) && now >= this.deadline) {
+        this.fail("Redis connect timed out")
+    } else if (this.state == redisAsyncOpen && this.inFlightSince.size > 0 &&
+        now - this.inFlightSince[0] >= this.options.replyTimeoutMilliseconds) {
+        this.fail("Redis reply timed out")
+    }
+    return
+}
+
+// Progresses the connection for up to `timeoutMilliseconds` (0 never blocks).
+fun RedisAsyncClient.step(timeoutMilliseconds: int = 0): int {
+    this.timers(redisAsyncNow())
+    var timeout = timeoutMilliseconds
+    if (timeout < 0 || this.descriptor < 0) timeout = 0
+    val records = this.poller.waitCompact(64, timeout)
+    var handled = 0
+    var index = 0
+    while (index + 12 <= records.size) {
+        val flags = textReadU32LittleEndian(records, index)
+        val descriptor = textReadU32LittleEndian(records, index + 4)
+        if (descriptor == this.descriptor && descriptor >= 0) {
+            val readable = (flags & 1) != 0
+            val writable = (flags & 4) != 0
+            val failed = (flags & 8) != 0 || (flags & 16) != 0 || (flags & 8192) != 0
+            this.socketReady(readable, writable, failed)
+            handled = handled + 1
+        }
+        index = index + 12
+    }
+    this.timers(redisAsyncNow())
+    handled
+}
+
+// Queues one command (arguments are bulk strings, so data never becomes
+// protocol syntax); the reply carries the returned id.
+fun RedisAsyncClient.command(arguments: array<string>): int {
+    val id = this.nextId
+    this.nextId = this.nextId + 1
+    val encoded = redisEncodeCommand(arguments)
+    if (this.state == redisAsyncOpen) {
+        this.inFlight.append(id)
+        this.inFlightSince.append(redisAsyncNow())
+        this.queueWrite(encoded)
+    } else {
+        this.queued.append(encoded)
+        this.queuedIds.append(id)
+        this.queuedSince.append(redisAsyncNow())
+        if (this.state == redisAsyncIdle && redisAsyncNow() >= this.retryAt) this.startConnect()
+    }
+    id
+}
+
+fun RedisAsyncClient.get(key: string): int = this.command(["GET", key])
+
+fun RedisAsyncClient.set(key: string, value: string): int = this.command(["SET", key, value])
+
+fun RedisAsyncClient.delete(key: string): int = this.command(["DEL", key])
+
+fun RedisAsyncClient.expire(key: string, seconds: int): int = this.command(["EXPIRE", key, "$seconds"])
+
+fun RedisAsyncClient.takeReplies(): array<RedisAsyncReply> {
+    val taken: array<RedisAsyncReply> = []
+    for (reply in this.replies) taken.append(RedisAsyncReply(reply.id, redisCopy(reply.value)))
+    this.replies = []
+    taken
+}
+
+fun redisCopy(value: RedisValue): RedisValue {
+    val items: array<RedisValue> = []
+    for (item in value.items) items.append(redisCopy(item))
+    RedisValue(value.kind, value.text, value.integer, items, value.error)
+}
+
+fun RedisAsyncClient.takeEvents(): array<RedisAsyncEvent> {
+    val taken: array<RedisAsyncEvent> = []
+    for (event in this.events) taken.append(RedisAsyncEvent(event.kind, event.detail))
+    this.events = []
+    taken
+}
+
+fun RedisAsyncClient.isConnected(): bool = this.state == redisAsyncOpen
+
+// Commands written or waiting, not yet answered.
+fun RedisAsyncClient.pending(): int {
+    var count = this.queued.size
+    for (id in this.inFlight) if (id > 0) count = count + 1
+    count
+}
+
+fun RedisAsyncClient.close(): void {
+    this.fail("closed")
+    for (id in this.queuedIds) this.replies.append(RedisAsyncReply(id, redisFailure("closed")))
+    this.queued = []
+    this.queuedIds = []
+    this.queuedSince = []
+    return
+}
+
+// The poller descriptor; register it with another event loop to wake on traffic.
+fun RedisAsyncClient.pollDescriptor(): int = this.poller.descriptor

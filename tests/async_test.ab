@@ -1,0 +1,98 @@
+// redisAsyncClient against a real server (tools/test-async.sh): pipelined
+// commands answered in order, null and error replies, MULTI/EXEC, a wrong
+// password failing its commands, a restart mid-run, and TLS.
+
+import "abla/io"
+import "abla/sys/linux/process"
+import "../src/async.ab"
+
+fun env(name: string): string = linuxEnvironment(name).value
+
+fun port(name: string): int = redisParseInt(env(name), 6379)
+
+fun run(var client: RedisAsyncClient, want: int, seconds: int): array<RedisAsyncReply> {
+    val got: array<RedisAsyncReply> = []
+    val deadline = linuxMonotonicMilliseconds() + seconds * 1000
+    while (got.size < want && linuxMonotonicMilliseconds() < deadline) {
+        client.step(10)
+        for (reply in client.takeReplies()) got.append(reply)
+    }
+    got
+}
+
+fun main: int {
+    var client = redisAsyncClient(RedisAsyncOptions("127.0.0.1", port("REDIS_PORT"), "", env("REDIS_PASSWORD")))
+    val set = client.set("async:k", "v1")
+    val get = client.get("async:k")
+    val missing = client.get("async:missing")
+    val incr = client.command(["INCRBY", "async:n", "5"])
+    val bad = client.command(["INCR", "async:k"])
+    val multi = client.command(["MULTI"])
+    client.command(["INCR", "async:n"])
+    client.command(["EXPIRE", "async:n", "60"])
+    val exec = client.command(["EXEC"])
+    val replies = run(client, 9, 10)
+    if (replies.size != 9) return 10
+    for (reply in replies) {
+        if (reply.id == set && reply.value.text != "OK") return 11
+        if (reply.id == get && reply.value.text != "v1") return 12
+        if (reply.id == missing && !reply.value.isNull()) return 13
+        if (reply.id == incr && reply.value.integer != 5) return 14
+        if (reply.id == bad && reply.value.kind != "error") return 15
+        if (reply.id == multi && reply.value.text != "OK") return 16
+        if (reply.id == exec && (reply.value.kind != "array" || reply.value.items.size != 2 || reply.value.items[0].integer != 6)) return 17
+    }
+    // order: ids come back ascending
+    var previous = 0
+    for (reply in replies) {
+        if (reply.id <= previous) return 18
+        previous = reply.id
+    }
+
+    // wrong password: the commands behind AUTH fail with its error
+    var wrong = redisAsyncClient(RedisAsyncOptions("127.0.0.1", port("REDIS_PORT"), "", "definitely-wrong"))
+    wrong.get("async:k")
+    val deniedAfter = run(wrong, 1, 5)
+    if (deniedAfter.size != 1 || deniedAfter[0].value.succeeded()) return 20
+    wrong.close()
+
+    // restart: tools/test-async.sh restarts the server ~2s after RESTART_SIGNAL
+    println("RESTART_SIGNAL")
+    var sawDisconnect = false
+    var after = ""
+    val deadline = linuxMonotonicMilliseconds() + 20000
+    var asked = false
+    var askedId = 0
+    while (after == "" && linuxMonotonicMilliseconds() < deadline) {
+        if (!asked || (client.pending() == 0 && after == "")) {
+            askedId = client.get("async:k")
+            asked = true
+        }
+        client.step(20)
+        for (event in client.takeEvents()) if (event.kind == "disconnected") sawDisconnect = true
+        for (reply in client.takeReplies()) {
+            // an answered command after the disconnect means we reconnected
+            if (reply.id == askedId && sawDisconnect && reply.value.kind != "transport") after = "reconnected"
+        }
+        linuxSleepMillisecondsChecked(50)
+    }
+    client.close()
+    if (!sawDisconnect) return 30
+    if (after != "reconnected") return 31
+
+    // TLS with the throwaway CA, and a wrong CA refused
+    var secure = redisAsyncClient(RedisAsyncOptions("localhost", port("REDIS_TLS_PORT"), "", env("REDIS_PASSWORD"), true, env("REDIS_CA")))
+    secure.set("tls:k", "over tls")
+    secure.get("tls:k")
+    val tlsReplies = run(secure, 2, 10)
+    secure.close()
+    if (tlsReplies.size != 2 || tlsReplies[1].value.text != "over tls") return 40
+    // its command waits for a connection that never verifies, then fails
+    var untrusted = redisAsyncClient(RedisAsyncOptions("localhost", port("REDIS_TLS_PORT"), "", env("REDIS_PASSWORD"), true, env("REDIS_OTHER_CA"),
+        replyTimeoutMilliseconds = 2000))
+    untrusted.get("tls:k")
+    val refused = run(untrusted, 1, 10)
+    untrusted.close()
+    if (refused.size != 1 || refused[0].value.succeeded()) return 41
+    0
+}
