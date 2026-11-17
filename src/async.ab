@@ -18,6 +18,7 @@ import "abla/http/async"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "./redis.ab"
+import "abla/unsafe/memory/raw"
 
 class RedisAsyncOptions(
     val host: string = "127.0.0.1",
