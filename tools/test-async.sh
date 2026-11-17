@@ -26,6 +26,8 @@ openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' \
 printf 'subjectAltName=DNS:localhost\n' > "$certs/san.ext"
 openssl x509 -req -in "$certs/server.csr" -CA "$certs/ca.pem" -CAkey "$certs/ca.key" -CAcreateserial \
     -days 1 -extfile "$certs/san.ext" -out "$certs/server.pem" 2>/dev/null
+# The container's redis user reads the certificates through the mount: mktemp makes the directory 0700.
+chmod 755 "$certs"
 chmod 644 "$certs"/*
 
 port=$(free_port)

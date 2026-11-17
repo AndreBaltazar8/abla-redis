@@ -15,10 +15,11 @@ import "abla/text"
 import "abla/dns"
 import "abla/dns/async"
 import "abla/http/async"
+import "abla/tls/pure"
 import "abla/sys/linux/net"
 import "abla/sys/linux/process"
 import "./redis.ab"
-import "abla/unsafe/memory/raw"
+
 
 class RedisAsyncOptions(
     val host: string = "127.0.0.1",
@@ -61,7 +62,8 @@ resource class RedisAsyncClient(
     var resolveId: int,
     var state: int,
     var descriptor: int,
-    var sslContext: int,
+    // The TLS of the connection (abla/tls/pure over the socket); `session` says whether it is in use (1) or the connection is plain (0).
+    var tls: TlsSession,
     var session: int,
     var output: string,
     var outputOffset: int,
@@ -82,16 +84,12 @@ resource class RedisAsyncClient(
 ) {
     trusted fun drop(): void {
         if (this.session != 0) {
-            httpAsyncTlsFree(this.session)
+            this.tls.close()
             this.session = 0
         }
         if (this.descriptor >= 0) {
             linuxTcpCloseDescriptor(this.descriptor)
             this.descriptor = -1
-        }
-        if (this.sslContext != 0) {
-            SSL_CTX_free(nativePointerFromAddress(this.sslContext))
-            this.sslContext = 0
         }
         this.resolver.close()
         this.poller.close()
@@ -102,7 +100,7 @@ resource class RedisAsyncClient(
 fun redisAsyncClient(options: RedisAsyncOptions = RedisAsyncOptions()): RedisAsyncClient =
     RedisAsyncClient(
         options, socketPoller(), HttpAsyncRead("", 0),
-        dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = options.connectTimeoutMilliseconds, nameserver = options.dnsNameserver)), 0, redisAsyncIdle, -1, 0, 0,
+        dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = options.connectTimeoutMilliseconds, nameserver = options.dnsNameserver)), 0, redisAsyncIdle, -1, tlsSessionClient(-1, "", TLS_VERIFY_NONE), 0,
         "", 0, "", [], [], [], [], [], [], [], 1, 0, 0
     )
 
@@ -189,7 +187,7 @@ fun RedisAsyncClient.fail(detail: string): void {
         this.resolveId = 0
     }
     if (this.session != 0) {
-        httpAsyncTlsFree(this.session)
+        this.tls.close()
         this.session = 0
     }
     if (this.descriptor >= 0) {
@@ -255,23 +253,57 @@ fun RedisAsyncClient.connectTo(address: string): void {
     return
 }
 
+// The TLS of the connection is a TlsSession of abla/tls/pure over its non-blocking socket. An empty caPath is the system trust store; the server's name is checked
+// as a DNS name or an IP address (by subjectAltName).
 fun RedisAsyncClient.connected(): void {
     if (this.options.tls) {
-        if (this.sslContext == 0) this.sslContext = httpAsyncTlsContext(this.options.caPath)
-        val session = if (this.sslContext == 0) 0 else httpAsyncTlsSession(this.sslContext, this.options.host, this.descriptor)
-        if (session == 0) {
+        val session = tlsSessionClient(this.descriptor, this.options.host, TLS_VERIFY_HOST, this.options.caPath)
+        if (!session.ok()) {
             this.fail("tls setup failed")
             return
         }
-        this.session = session
+        this.tls = session
+        this.session = 1
         this.state = redisAsyncHandshaking
         this.handshake()
     } else this.opened()
     return
 }
 
+// Returns 1 when complete, -2 or -3 while the socket must become readable or writable, -100 when the certificate was refused, -1 for any other failure.
+fun RedisAsyncClient.tlsHandshake(): int {
+    val status = this.tls.handshake()
+    if (status == 1) return 1
+    if (status == 2) return -2
+    if (status == 3) return -3
+    val client = this.tls.client
+    if (client.chain.size > 0 && !client.connected()) -100 else -1
+}
+
+// Fills the reader: the bytes read (status > 0), else -2 = want read, -3 = want write, -6 = clean close, -1 = failure.
+fun RedisAsyncClient.tlsRead(): void {
+    val read = this.tls.readReady(16384)
+    if (read.status == 1 && read.bytes.size > 0) {
+        this.reader.text = read.bytes
+        this.reader.status = read.bytes.size
+    } else {
+        this.reader.text = ""
+        this.reader.status = if (read.status == 2) -2 else if (read.status == 3) -3 else if (read.status == 0) -6 else -1
+    }
+    return
+}
+
+// Returns the bytes written, -2 or -3 for a socket that must become readable or writable first, -1 for a failure.
+fun RedisAsyncClient.tlsWrite(contents: string, offset: int): int {
+    val sent = this.tls.writeReady(contents, offset)
+    if (sent.status == 1 && sent.written > 0) sent.written
+    else if (sent.status == 3) -3
+    else if (sent.status == 2) -2
+    else -1
+}
+
 fun RedisAsyncClient.handshake(): void {
-    val result = httpAsyncTlsHandshake(this.session)
+    val result = this.tlsHandshake()
     if (result == 1) this.opened()
     else if (result == -2) this.interest(false)
     else if (result == -3) this.interest(true)
@@ -326,7 +358,7 @@ fun RedisAsyncClient.writeReady(): void {
             this.interest(false)
             writing = false
         } else if (this.session != 0) {
-            val written = httpAsyncTlsWrite(this.session, this.output, this.outputOffset)
+            val written = this.tlsWrite(this.output, this.outputOffset)
             if (written > 0) this.outputOffset = this.outputOffset + written
             else if (written == -3 || written == -2) {
                 this.interest(true)
@@ -353,7 +385,7 @@ fun RedisAsyncClient.writeReady(): void {
 fun RedisAsyncClient.readReady(): void {
     var reading = this.descriptor >= 0
     while (reading) {
-        if (this.session != 0) httpAsyncTlsRead(this.session, this.reader)
+        if (this.session != 0) this.tlsRead()
         else httpAsyncPlainRead(this.descriptor, this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
