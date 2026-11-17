@@ -15,7 +15,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+# A port nobody listens on (a connect is refused), below the ephemeral range; a published port of a running container counts as taken.
+free_port() {
+    local candidate
+    for _ in $(seq 100); do
+        candidate=$((20000 + RANDOM % 10000))
+        (exec 3<> "/dev/tcp/127.0.0.1/$candidate") 2> /dev/null || { echo "$candidate"; return 0; }
+    done
+    echo "no free port" >&2
+    return 1
+}
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=abla test ca' \
     -keyout "$certs/ca.key" -out "$certs/ca.pem" 2>/dev/null
