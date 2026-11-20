@@ -262,7 +262,7 @@ fun RedisAsyncClient.connected(): void {
             this.fail("tls setup failed")
             return
         }
-        this.tls = session
+        this.tls = move(session)
         this.session = 1
         this.state = redisAsyncHandshaking
         this.handshake()
