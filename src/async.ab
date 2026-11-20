@@ -12,7 +12,6 @@
 //     for (reply in cache.takeReplies()) if (reply.id == id) use(reply.value)
 
 import "abla/text"
-import "abla/dns"
 import "abla/dns/async"
 import "abla/http/async"
 import "abla/tls/pure"
