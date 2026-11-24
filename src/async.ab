@@ -81,7 +81,7 @@ resource class RedisAsyncClient(
     var retryAt: int,
     var deadline: int
 ) {
-    trusted fun drop(): void {
+    fun drop(): void {
         if (this.session != 0) {
             this.tls.close()
             this.session = 0
