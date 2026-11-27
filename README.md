@@ -100,4 +100,12 @@ Sentinel, Cluster redirections, client-side caching, and pub/sub are future
 layers; ordinary commands and RESP3 values are already represented
 without constraining those additions.
 
+Replies are bounded, whatever the server sends: `maximumReplyBytes` (on
+`RedisConfig` and `RedisAsyncOptions`, default 256 MiB) bounds one reply's
+bytes, nested values included, and the async client never buffers more than
+that of an unfinished one. A reply also nests at most 64 levels and holds at
+most 4194304 values in all; a bulk string is at most 16 MiB and a collection
+at most 1048576 entries. A reply past a bound fails its command and closes the
+connection.
+
 Licensed under the Mozilla Public License 2.0.

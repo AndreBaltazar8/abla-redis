@@ -11,8 +11,22 @@ class RedisConfig(
     val password: string = "",
     val database: int = 0,
     val connectTimeoutMilliseconds: int = 3000,
-    val readTimeoutMilliseconds: int = 5000
+    val readTimeoutMilliseconds: int = 5000,
+    // The bytes one reply may take on the wire, nested values included: past it the reply fails and the connection closes, so a
+    // server (or anyone between it and the client: this client has no TLS) cannot make the client allocate without bound.
+    val maximumReplyBytes: int = redisDefaultMaximumReplyBytes
 )
+
+// RedisConfig.maximumReplyBytes' default: 256 MiB.
+val redisDefaultMaximumReplyBytes = 268435456
+
+// Fixed bounds on one reply, whatever the byte bound: collections nested deeper than this (Redis' own replies nest a few levels), and
+// values in all (RESP's elements, nested ones included; a map's entry counts twice).
+val redisMaximumReplyDepth = 64
+val redisMaximumReplyElements = 4194304
+
+// What one reply has used of its bounds so far, through RedisStream.next's recursion.
+class RedisBudget(var bytes: int, var elements: int)
 
 class RedisValue(
     val kind: string,
@@ -60,6 +74,8 @@ fun redisParseInt(value: string, fallback: int = 0): int {
         index = 1
         if (index == value.size) valid = false
     }
+    // 18 digits always fit: a longer number would wrap, and no length or count needs it.
+    if (value.size - index > 18) valid = false
     while (valid && index < value.size) {
         val digit = value[index] - 48
         if (digit < 0 || digit > 9) valid = false
@@ -159,7 +175,19 @@ fun RedisStream.line(timeoutMilliseconds: int): RedisLine {
     result
 }
 
-fun RedisStream.next(timeoutMilliseconds: int): RedisValue {
+// One reply, within maximumBytes on the wire and redisMaximumReplyDepth / redisMaximumReplyElements. A reply past a bound is a
+// transport failure, which closes the client's connection: the rest of it is never read.
+fun RedisStream.next(timeoutMilliseconds: int, maximumBytes: int = redisDefaultMaximumReplyBytes): RedisValue =
+    this.nextWithin(timeoutMilliseconds, RedisBudget(maximumBytes, redisMaximumReplyElements), 0)
+
+private fun redisSpend(var budget: RedisBudget, bytes: int): bool {
+    budget.bytes = budget.bytes - bytes
+    budget.bytes >= 0
+}
+
+private fun RedisStream.nextWithin(timeoutMilliseconds: int, var budget: RedisBudget, depth: int): RedisValue {
+    budget.elements = budget.elements - 1
+    if (budget.elements < 0) return redisFailure("Redis reply has more than $redisMaximumReplyElements values")
     if (!this.ensure(1, timeoutMilliseconds)) {
         return redisFailure("Timed out while reading Redis response")
     }
@@ -169,6 +197,7 @@ fun RedisStream.next(timeoutMilliseconds: int): RedisValue {
         marker == 35 || marker == 95) {
         val line = this.line(timeoutMilliseconds)
         if (!line.valid) return redisFailure("Redis response line is incomplete")
+        if (!redisSpend(budget, line.text.size + 3)) return redisFailure("Redis reply is over its byte bound (maximumReplyBytes)")
         if (marker == 43) return redisValue("simple", line.text)
         if (marker == 45) return redisValue(
             "error", line.text, 0, [], line.text
@@ -190,6 +219,7 @@ fun RedisStream.next(timeoutMilliseconds: int): RedisValue {
         if (count < 0 || count > 16777216) {
             return redisFailure("Redis bulk length is invalid")
         }
+        if (!redisSpend(budget, line.text.size + 3 + count + 2)) return redisFailure("Redis reply is over its byte bound (maximumReplyBytes)")
         if (!this.ensure(count + 2, timeoutMilliseconds) ||
             this.buffered[count] != 13 || this.buffered[count + 1] != 10) {
             return redisFailure("Redis bulk payload is incomplete")
@@ -208,12 +238,15 @@ fun RedisStream.next(timeoutMilliseconds: int): RedisValue {
         if (count < 0 || count > 1048576) {
             return redisFailure("Redis collection length is invalid")
         }
+        if (depth >= redisMaximumReplyDepth) return redisFailure("Redis reply nests deeper than $redisMaximumReplyDepth")
+        if (!redisSpend(budget, line.text.size + 3)) return redisFailure("Redis reply is over its byte bound (maximumReplyBytes)")
         if (marker == 37) count = count * 2
+        // A count is a claim: values arrive (and are charged) one by one, so it reserves nothing.
         val items: array<RedisValue> = []
         var index = 0
         var error = ""
         while (error == "" && index < count) {
-            val item = this.next(timeoutMilliseconds)
+            val item = this.nextWithin(timeoutMilliseconds, budget, depth + 1)
             if (item.kind == "transport") error = item.error
             else items.append(item)
             index = index + 1
@@ -258,7 +291,7 @@ fun RedisClient.send(arguments: array<string>): RedisValue {
         this.disconnect()
         redisFailure("Could not write Redis command")
     } else {
-        val result = this.stream.next(this.config.readTimeoutMilliseconds)
+        val result = this.stream.next(this.config.readTimeoutMilliseconds, this.config.maximumReplyBytes)
         if (result.kind == "transport") this.disconnect()
         result
     }

@@ -1,0 +1,103 @@
+import "../src/redis.ab"
+import "../src/async.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// One reply's bounds against a hostile server: nesting (redisMaximumReplyDepth), values in all (redisMaximumReplyElements) and wire bytes
+// (maximumReplyBytes), in the blocking parser, the async parser and the async client over a socket. A reply past a bound is a transport
+// failure, never a crash, and a reply within them parses as before.
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+fun stream(text: string): RedisStream {
+    var connection = TcpConnection(-1)
+    RedisStream(move(connection), text)
+}
+
+fun nested(depth: int): string = "${"*1\r\n".repeat(depth)}:1\r\n"
+
+// `outer` arrays of `inner` integers.
+fun wide(outer: int, inner: int): string = "*$outer\r\n${"*$inner\r\n${":1\r\n".repeat(inner)}".repeat(outer)}"
+
+trusted fun server(): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    peer.readWithTimeoutResult(4096,2000)
+    // A reply that never ends: an array that claims a million values, sent forever.
+    peer.write("*1048576\r\n")
+    var sending=true
+    while(sending) if(peer.write(":1\r\n".repeat(4096))<0) sending=false
+    0
+}
+
+trusted fun overSocket(): void {
+    val parent=linuxProcessId()
+    val ready="build/reply-bounds-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=redisParseInt(linuxReadFile(ready,64).trim(),0); if(port<=0) sleep(5) }
+    check("server started",port>0)
+    if(port>0) {
+        var client=redisAsyncClient(RedisAsyncOptions("127.0.0.1",port,maximumReplyBytes=65536))
+        val id=client.command(["GET","k"])
+        var answer=redisValue("none")
+        var found=false
+        val deadline=linuxMonotonicMilliseconds()+5000
+        while(!found && linuxMonotonicMilliseconds()<deadline) {
+            client.step(10)
+            for(reply in client.takeReplies()) if(reply.id==id) { answer=reply.value; found=true }
+        }
+        check("an endless reply fails the command (async client): found=$found error=${answer.error}",found && answer.error.contains("maximumReplyBytes"))
+        check("and keeps no more than its bound buffered: ${client.input.size}",client.input.size<=65536)
+    }
+    linuxSyscall2(62,child.process,9)
+    linuxWaitProcess(child.process)
+    Path(ready).remove()
+    return
+}
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server()
+    // Nesting: a few levels parse; past the bound, a failure in place of running out of stack.
+    val shallow=stream(nested(10)).next(1)
+    check("10 levels parse (blocking)",shallow.kind=="array")
+    val deep=stream(nested(200000)).next(1)
+    check("200000 levels fail (blocking): ${deep.error}",deep.kind=="transport" && deep.error.contains("deeper"))
+    check("10 levels parse (async)",redisParseAt(nested(10),0).value.kind=="array")
+    val deepAsync=redisParseAt(nested(200000),0)
+    check("200000 levels fail (async): ${deepAsync.value.error}",deepAsync.complete && deepAsync.value.kind=="transport" && deepAsync.value.error.contains("deeper"))
+    // Values in all: each collection under its own count bound, the reply over the total one.
+    val many=wide(5,1048576)
+    val manyBlocking=stream(many).next(1)
+    check("5 x 1048576 values fail (blocking): ${manyBlocking.error}",manyBlocking.kind=="transport" && manyBlocking.error.contains("values"))
+    val manyAsync=redisParseAt(many,0)
+    check("5 x 1048576 values fail (async): ${manyAsync.value.error}",manyAsync.value.kind=="transport" && manyAsync.value.error.contains("values"))
+    val fewer=wide(1,1048576)
+    check("1 x 1048576 values parse (blocking)",stream(fewer).next(1).items[0].items.size==1048576)
+    check("1 x 1048576 values parse (async)",redisParseAt(fewer,0).value.items[0].items.size==1048576)
+    // Bytes: a bulk string and an array of them, against a 1000-byte bound.
+    check("a 2000-byte bulk over a 1000-byte bound fails",stream("\$2000\r\n${"x".repeat(2000)}\r\n").next(1,1000).kind=="transport")
+    check("an array of 300 small bulks over it fails",stream("*300\r\n${"\$4\r\nabcd\r\n".repeat(300)}").next(1,1000).kind=="transport")
+    check("an array of 50 within it parses",stream("*50\r\n${"\$4\r\nabcd\r\n".repeat(50)}").next(1,1000).items.size==50)
+    // Lengths that would wrap.
+    check("a 20-digit bulk length is invalid",stream("\$18446744073709551621\r\nhello\r\n").next(1).kind=="transport")
+    overSocket()
+    if(failures==0) println("ok reply bounds")
+    if(failures==0) 0 else 1
+}

@@ -35,7 +35,10 @@ class RedisAsyncOptions(
     // for a connection this long fails on its own
     val replyTimeoutMilliseconds: int = 10000,
     // the DNS server for the host; empty reads /etc/resolv.conf
-    val dnsNameserver: string = ""
+    val dnsNameserver: string = "",
+    // the bytes one reply may take, nested values included (RedisConfig.maximumReplyBytes): past it, or while an unfinished reply
+    // holds more, the connection fails, so a server cannot make the client buffer or allocate without bound
+    val maximumReplyBytes: int = redisDefaultMaximumReplyBytes
 )
 
 class RedisAsyncReply(val id: int, val value: RedisValue)
@@ -43,7 +46,8 @@ class RedisAsyncReply(val id: int, val value: RedisValue)
 // kind: connecting | connected | disconnected | error
 class RedisAsyncEvent(val kind: string, val detail: string)
 
-class RedisParsed(val value: RedisValue, val next: int, val complete: bool)
+// `elements`: the values in `value`, nested ones included, against redisMaximumReplyElements.
+class RedisParsed(val value: RedisValue, val next: int, val complete: bool, val elements: int = 1)
 
 val redisAsyncIdle = 0
 val redisAsyncConnecting = 1
@@ -119,7 +123,7 @@ fun redisAsyncNow(): int = linuxMonotonicMilliseconds()
 
 // One whole RESP value at `offset`, or incomplete (complete false, value a
 // transport failure when the bytes can never parse).
-fun redisParseAt(buffer: string, offset: int): RedisParsed {
+fun redisParseAt(buffer: string, offset: int, depth: int = 0): RedisParsed {
     if (offset >= buffer.size) return RedisParsed(redisValue("null"), offset, false)
     val marker = buffer[offset]
     var end = -1
@@ -150,20 +154,24 @@ fun redisParseAt(buffer: string, offset: int): RedisParsed {
         var count = redisParseInt(line, -2)
         if (count == -1) return RedisParsed(redisValue("null"), after, true)
         if (count < 0 || count > 1048576) return RedisParsed(redisFailure("Redis collection length is invalid"), after, true)
+        if (depth >= redisMaximumReplyDepth) return RedisParsed(redisFailure("Redis reply nests deeper than $redisMaximumReplyDepth"), after, true)
         if (marker == 37) count = count * 2
         val items: array<RedisValue> = []
         var at = after
         var item = 0
+        var elements = 1
         while (item < count) {
-            val parsed = redisParseAt(buffer, at)
+            val parsed = redisParseAt(buffer, at, depth + 1)
             if (!parsed.complete) return RedisParsed(redisValue("null"), offset, false)
             if (parsed.value.kind == "transport") return RedisParsed(parsed.value, parsed.next, true)
+            elements = elements + parsed.elements
+            if (elements > redisMaximumReplyElements) return RedisParsed(redisFailure("Redis reply has more than $redisMaximumReplyElements values"), parsed.next, true)
             items.append(parsed.value)
             at = parsed.next
             item = item + 1
         }
         val kind = if (marker == 37) "map" else if (marker == 126) "set" else if (marker == 62) "push" else "array"
-        return RedisParsed(redisValue(kind, "", 0, items), at, true)
+        return RedisParsed(redisValue(kind, "", 0, items), at, true, elements)
     }
     RedisParsed(redisFailure("Redis response has an unsupported type marker"), after, true)
 }
@@ -411,6 +419,12 @@ fun RedisAsyncClient.parse(): void {
     var going = true
     while (going) {
         val parsed = redisParseAt(this.input, offset)
+        val size = if (parsed.complete) parsed.next - offset else this.input.size - offset
+        if (size > this.options.maximumReplyBytes) {
+            this.input = ""
+            this.fail("Redis reply is over its byte bound (maximumReplyBytes ${this.options.maximumReplyBytes})")
+            return
+        }
         if (!parsed.complete) going = false
         else if (parsed.value.kind == "transport") {
             this.input = ""
