@@ -83,7 +83,10 @@ resource class RedisAsyncClient(
     var events: array<RedisAsyncEvent>,
     var nextId: int,
     var retryAt: int,
-    var deadline: int
+    var deadline: int,
+    // readReady stopped at its per-call budget with input maybe still waiting (in the socket or a TLS record): the next step reads
+    // again before it waits
+    var readPending: bool = false
 ) {
     fun drop(): void {
         if (this.session != 0) {
@@ -188,6 +191,7 @@ fun RedisAsyncClient.interest(write: bool): void {
 
 // Drops the connection: in-flight commands fail, queued ones wait for the next.
 fun RedisAsyncClient.fail(detail: string): void {
+    this.readPending = false
     val wasOpen = this.state == redisAsyncOpen
     if (this.resolveId != 0) {
         this.resolver.cancel(this.resolveId)
@@ -389,15 +393,26 @@ fun RedisAsyncClient.writeReady(): void {
     return
 }
 
+// The bytes one readReady takes before it hands control back to step(): a server that never stops sending cannot keep step() from
+// returning, or pile up replies without bound in one call.
+val redisAsyncReadBudget = 1048576
+
 fun RedisAsyncClient.readReady(): void {
     var reading = this.descriptor >= 0
+    var taken = 0
+    this.readPending = false
     while (reading) {
+        if (taken >= redisAsyncReadBudget) {
+            this.readPending = true
+            return
+        }
         if (this.session != 0) this.tlsRead()
         else httpAsyncPlainRead(this.descriptor, this.reader)
         val status = this.reader.status
         val chunk = this.reader.text
         this.reader.text = ""
         if (status > 0) {
+            taken = taken + chunk.size
             this.input = if (this.input == "") chunk else "${this.input}$chunk"
             this.parse()
             reading = this.descriptor >= 0
@@ -522,6 +537,9 @@ fun RedisAsyncClient.step(timeoutMilliseconds: int = 0): int {
     }
     var timeout = timeoutMilliseconds
     if (timeout < 0 || this.descriptor < 0) timeout = 0
+    // Input left by the last read's budget is read now, without waiting: bytes a TLS record already holds raise no readiness event.
+    val pending = this.readPending && this.descriptor >= 0
+    if (pending) timeout = 0
     val records = this.poller.waitCompact(64, timeout)
     var handled = 0
     var index = 0
@@ -536,6 +554,10 @@ fun RedisAsyncClient.step(timeoutMilliseconds: int = 0): int {
             handled = handled + 1
         }
         index = index + 12
+    }
+    if (pending && this.readPending && this.descriptor >= 0) {
+        this.readReady()
+        handled = handled + 1
     }
     this.timers(redisAsyncNow())
     handled

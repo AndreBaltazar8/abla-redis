@@ -9,6 +9,8 @@ check:
 	build/protocol-test
 	$(COMPILER) build tests/reply_bounds_test.ab -o build/reply-bounds-test --fast --no-cache
 	build/reply-bounds-test
+	$(COMPILER) build tests/read_budget_test.ab -o build/read-budget-test --fast --no-cache
+	build/read-budget-test
 
 test: check
 	ABLAC=$(COMPILER) ./tools/test-redis.sh

@@ -1,0 +1,72 @@
+import "../src/async.ab"
+import "../src/redis.ab"
+import "abla/io"
+import "abla/fs"
+import "abla/process/time"
+import "abla/sys/linux/net"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/text"
+
+// A server that never stops sending (RESP3 pushes, which the client skips) cannot keep step() from returning: each step reads at most
+// redisAsyncReadBudget (plus one more when the last read stopped at it), and a command's reply behind the flood still arrives.
+// The server is this program run again as a child.
+
+trusted fun server(): int {
+    val listener=tcpListenAddress(Ipv4SocketAddress("127.0.0.1",0))
+    if(listener.descriptor<0) return 3
+    println("${listener.localPort()}")
+    val peer=listener.accept()
+    peer.readWithTimeoutResult(65536,2000)
+    val burst=">2\r\n\$3\r\nfoo\r\n\$3\r\nbar\r\n".repeat(4096)
+    // 32 MiB of pushes, then the GET's reply, then pushes for ever
+    for(i in 0 until 320) peer.write(burst)
+    peer.write("\$5\r\nvalue\r\n")
+    var sending=true
+    while(sending) if(peer.write(burst)<0) sending=false
+    0
+}
+
+var failures = 0
+
+fun check(name: string, ok: bool): void {
+    if (!ok) {
+        println("FAIL $name")
+        failures = failures + 1
+    }
+    return
+}
+
+trusted fun main: int {
+    if(linuxArgument(0)=="server") return server()
+    val parent=linuxProcessId()
+    val ready="build/read-budget-$parent.ready"
+    val child=linuxCommand("/proc/$parent/exe").argument("server").output(ready).start()
+    val readyDeadline=linuxMonotonicMilliseconds()+3000
+    var port=0
+    while(port<=0 && linuxMonotonicMilliseconds()<readyDeadline) { port=redisParseInt(linuxReadFile(ready,64).trim(),0); if(port<=0) sleep(5) }
+    check("server started",port>0)
+    if(port>0) {
+        var client=redisAsyncClient(RedisAsyncOptions("127.0.0.1",port))
+        val id=client.command(["GET","k"])
+        var steps=0
+        var value=""
+        val deadline=linuxMonotonicMilliseconds()+20000
+        while(value=="" && linuxMonotonicMilliseconds()<deadline) {
+            client.step(10)
+            for(reply in client.takeReplies()) if(reply.id==id) value=reply.value.text
+            steps=steps+1
+        }
+        check("the reply behind 32 MiB of pushes arrives: $value",value=="value")
+        // 32 MiB at most two budgets (plus a read's overshoot) a step: at least 12 steps returned while the server flooded.
+        check("steps returned during the flood: $steps",steps>=12)
+        var more=0
+        while(more<10) { client.step(0); more=more+1 }
+        check("steps keep returning while it floods",more==10)
+    }
+    linuxSyscall2(62,child.process,9)
+    linuxWaitProcess(child.process)
+    Path(ready).remove()
+    if(failures==0) println("ok read budget")
+    if(failures==0) 0 else 1
+}
